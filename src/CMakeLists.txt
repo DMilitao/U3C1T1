@@ -1,3 +1,5 @@
+SET(ProjectName U3C1T1)
+
 add_executable(${ProjectName}
     main.c
 )
@@ -8,7 +10,13 @@ target_include_directories(${ProjectName} PRIVATE
 
 target_link_libraries(${ProjectName} 
     pico_stdlib 
+    hardware_i2c
+    hardware_pwm
+    hardware_clocks
     FreeRTOS-Kernel-Heap4 
     )
+
+pico_enable_stdio_uart(${ProjectName} 0)
+pico_enable_stdio_usb(${ProjectName} 1)
 
 pico_add_extra_outputs(${ProjectName})
