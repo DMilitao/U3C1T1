@@ -2,6 +2,7 @@ SET(ProjectName U3C1T1)
 
 add_executable(${ProjectName}
     main.c
+    ssd1306_i2c.c
 )
 
 target_include_directories(${ProjectName} PRIVATE
