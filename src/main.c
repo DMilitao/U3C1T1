@@ -10,15 +10,12 @@
 #include "ssd1306.h"
 #include <math.h>
 
-#define SENSOR1_ADDR 0x38 // AHT10
-#define CMD_RESET 0xBA
-#define CMD_INIT 0xE1
-#define CMD_START_MEAS1 0xAC
-#define CMD_START_MEAS2 0x33
-#define CMD_START_MEAS3 0x00
+#define SENSOR1_ADDR 0x68 // MPU6050
+#define CMD_RESET 0x6B
+#define CMD_INIT 0x00
+#define CMD_READ 0x3B
 
-#define TH_MIN_TEMP 20.0f
-#define TH_MAX_HUM 70
+#define TH_MAX_INCL 30.0f
 
 #define I2C_PORT i2c0
 #define I2C_SDA_PIN 0
@@ -28,15 +25,19 @@
 #define I2C_OLED_SDA_PIN 14
 #define I2C_OLED_SCL_PIN 15
 
-#define BUZZER_PIN 21
 #define LEDR 13
+#define LEDB 12
+#define LEDG 11
 #define PWM_FREQ 1000       
 #define PWM_DIV 4.0f
 
-#define TimeTaskAcquisition 150
-#define TimeTaskProcessing 150
+#define TimeTaskAcquisition 300.0f
+#define TimeTaskProcessing 300.0f
 
-uint8_t data[6];
+uint8_t data[14];
+double pitch, roll;
+double AccX, AccY, AccZ, GyroX, GyroY, GyroZ;
+const double alpha = 0.9;
 uint8_t ssd[ssd1306_buffer_length];
 uint ticks_LEDs;
 
@@ -64,7 +65,7 @@ void write_OLED(uint8_t ssd[], char *text[], size_t size_text){
 
 
 void sensor1_read(uint8_t *buf) {
-    if(i2c_read_blocking(I2C_PORT, SENSOR1_ADDR, buf, 6, false) != 6){
+    if(i2c_read_blocking(I2C_PORT, SENSOR1_ADDR, buf, 14, false) != 14){
         printf("Error in Sensor 1!\n");
         while(true);
     }
@@ -94,24 +95,20 @@ void init_peripherals(){
 
     ticks_LEDs = (clock_get_hz(clk_sys) / (PWM_FREQ * PWM_DIV)) - 1;
     init_pwm(LEDR);
+    init_pwm(LEDB);
+    init_pwm(LEDG);
     set_pwm_level(LEDR, 0);
-    init_pwm(BUZZER_PIN);
-    set_pwm_level(BUZZER_PIN, 0);
-    
+    set_pwm_level(LEDB, 0);
+    set_pwm_level(LEDG, 0);
+
     i2c_init(I2C_PORT, 100 * 1000);
     gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA_PIN);
     gpio_pull_up(I2C_SCL_PIN);
 
-    uint8_t cmd = CMD_RESET;
-    if (i2c_write_blocking(I2C_PORT, SENSOR1_ADDR, &cmd, 1, false) < 0) {
-        printf("Error in Sensor 1!\n");
-        while(true);
-    }
-    sleep_ms(20);
-    cmd = CMD_INIT;
-    if (i2c_write_blocking(I2C_PORT, SENSOR1_ADDR, &cmd, 1, false) < 0) {
+    uint8_t cmd[] = {CMD_RESET, CMD_INIT};
+    if (i2c_write_blocking(I2C_PORT, SENSOR1_ADDR, cmd, 2, false) < 0) {
         printf("Error in Sensor 1!\n");
         while(true);
     }
@@ -135,15 +132,27 @@ void i2c_acquisition()
 {   
     const TickType_t xTimeTask = pdMS_TO_TICKS(TimeTaskAcquisition); 
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    uint8_t cmd[3] = {CMD_START_MEAS1, CMD_START_MEAS2, CMD_START_MEAS3};
 
     while (true) {
-        sensor1_read(data);
-
-        if (i2c_write_blocking(I2C_PORT, SENSOR1_ADDR, &cmd[0], 3, false) < 0) {
+        if (i2c_write_blocking(I2C_PORT, SENSOR1_ADDR, (uint8_t[]){CMD_READ}, 1, true) < 0) {
             printf("Error in Sensor 1!\n");
             while(true);
         }
+        sensor1_read(data);
+
+        AccX = (double)((int16_t)((data[0] << 8) & 0xFF00) + data[1])/16384.0;
+        AccY = (double)((int16_t)((data[2] << 8) & 0xFF00) + data[3])/16384.0;
+        AccZ = (double)((int16_t)((data[4] << 8) & 0xFF00) + data[5])/16384.0;
+        GyroX = (double)((int16_t)((data[8] << 8) & 0xFF00) + data[9])/131.0;
+        GyroY = (double)((int16_t)((data[10] << 8) & 0xFF00) + data[11])/131.0;
+        GyroZ = (double)((int16_t)((data[12] << 8) & 0xFF00) + data[13])/131.0;
+
+        float accelRoll = atan2(AccY, sqrt(AccX*AccX + AccZ*AccZ)) * 180.0 / 3.1415;
+        float accelPitch = atan2(-AccX, sqrt(AccY*AccY + AccZ*AccZ)) * 180.0 / 3.1415;
+
+        roll = alpha * (roll + GyroX*TimeTaskProcessing/1000) + (1 - alpha)*accelRoll;
+        pitch = alpha * (pitch + GyroY*TimeTaskProcessing/1000) + (1 - alpha)*accelPitch;
+
         vTaskDelayUntil(&xLastWakeTime, xTimeTask);
     }
 }
@@ -163,46 +172,35 @@ void i2c_processing()
     text[5] = malloc(15);
     text[6] = malloc(15);
     text[7] = malloc(15);
-    float hum = 0;
-    float temp = 0;
-    
-    while (true) {
-        hum = ( (float)(((unsigned long)data[1] << 12) | ((unsigned long)data[2] << 4) | (data[3] >> 4)) / 1048576.0 ) * 100.0;
-        temp = ( (float)((((unsigned long)data[3] & 0x0F) << 16) | ((unsigned long)data[4] << 8) | data[5]) / 1048576.0 ) * 200.0 - 50.0;
-        
-        bool flag_alert = false;
-        
-        if ( temp < TH_MIN_TEMP ){
-            strcpy(text[5], "Alert MIN TEMP");
-            flag_alert = true;
+
+    strcpy(text[0], " Monitor");
+
+    while (true) {       
+        set_pwm_level(LEDR, fabs(AccX));
+        set_pwm_level(LEDB, fabs(AccY));
+        set_pwm_level(LEDG, fabs(AccZ));
+
+        if ( fabs(roll) > TH_MAX_INCL || fabs(pitch) > TH_MAX_INCL ) {
+            sprintf(text[1], "               ");
+            sprintf(text[2], "               ");
+            sprintf(text[3], " ALERT  ALERT  ");
+            sprintf(text[4], "               ");
+            sprintf(text[5], "    REDUCE     ");
+            sprintf(text[6], "  INCLINATION  ");
+            sprintf(text[7], "               ");
         } else {
-            strcpy(text[5], "              ");
+            sprintf(text[1], "AccX: %.2f G   ", AccX);
+            sprintf(text[2], "AccY: %.2f G   ", AccY);
+            sprintf(text[3], "AccZ: %.2f G   ", AccZ);
+            sprintf(text[4], "GyrX: %.2f dps ", GyroX);
+            sprintf(text[5], "GyrY: %.2f dps ", GyroY);
+            sprintf(text[6], "GyrZ: %.2f dps ", GyroZ);
+            sprintf(text[7], "R: %.2f P:%.2f ", roll, pitch);
+
         }
 
-        if ( hum > TH_MAX_HUM ){
-            strcpy(text[7], "Alert MAX HUM");
-            flag_alert = true;
-        } else {
-            strcpy(text[7], "              ");
-        }
+        printf("AccX: %.2f G| AccY: %.2f G| AccZ: %.2f G| GyroX: %.2f dps| GyroY: %.2f dps| GyroZ: %.2f dps| Roll: %.2f d| Pitch: %.2f d|\n", AccX, AccY, AccZ, GyroX, GyroY, GyroZ, roll, pitch);
 
-        printf("Temp: %.2f °C | Hum: %.2f RH | Alert %s\n", temp, hum, (flag_alert ? "ON" : "OFF"));
-
-        if ( flag_alert ) {
-            set_pwm_level(LEDR, 0.5);
-            set_pwm_level(BUZZER_PIN, 0.5);
-        } else {
-            set_pwm_level(LEDR, 0);
-            set_pwm_level(BUZZER_PIN, 0);
-        }
-
-        strcpy(text[0], " Monitor");
-        strcpy(text[1], " ");
-        sprintf(text[2], "Temp: %.2f C  ", temp);
-        sprintf(text[3], " Hum: %.2f RH  ", hum);
-        strcpy(text[4], " ");
-        strcpy(text[6], " ");
-        
         write_OLED(ssd, text, sizeof(text)/sizeof(text[0]));
         vTaskDelayUntil(&xLastWakeTime, xTimeTask);
     }
@@ -211,8 +209,6 @@ void i2c_processing()
 int main()
 {
     stdio_init_all();
-
-    sleep_ms(1000);
 
     init_peripherals();
 
